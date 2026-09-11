@@ -20,6 +20,7 @@ VIRTUAL_KEYS = {
     "escape": 0x1B,
     "shift": 0x10,
     "win": 0x5B,
+    **{f"f{n}": 0x70 + n - 1 for n in range(1, 13)},
 }
 
 

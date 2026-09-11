@@ -16,6 +16,10 @@ from tests.support.send_keys import send_sequence
 
 SUPPORT = Path(__file__).resolve().parent / "support"
 PYTHON = sys.executable
+# The app itself may already be running from the Startup folder, so the tests
+# drive a second instance on a hotkey nobody else registers. Alt stays the only
+# modifier so the menu-bar suppression is still exercised.
+TEST_HOTKEY = "alt+f9"
 
 
 def _skip_reason() -> str | None:
@@ -68,7 +72,9 @@ def _wait_for_log(path: Path, needle: str, timeout: float = 10.0) -> str:
 @unittest.skipIf(_skip_reason(), _skip_reason() or "")
 class KeyIsolationTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.switcher = _Process([PYTHON, str(ROOT / "windowswitcher.py")], cwd=ROOT)
+        self.switcher = _Process(
+            [PYTHON, str(ROOT / "windowswitcher.py"), TEST_HOTKEY], cwd=ROOT
+        )
         self.addCleanup(self.switcher.stop)
         self.switcher.wait_alive()
 
@@ -80,7 +86,7 @@ class KeyIsolationTests(unittest.TestCase):
         _wait_for_log(log, "ready")
         time.sleep(1.0)
 
-        send_sequence("alt+q", "a", "esc")
+        send_sequence(TEST_HOTKEY, "a", "esc")
         during = _wait_for_log(log, "ready")
         texts = [line.split(":", 1)[1] for line in during.splitlines() if line.startswith("key ")]
         self.assertNotIn("'q'", texts)
@@ -92,7 +98,7 @@ class KeyIsolationTests(unittest.TestCase):
         after = _wait_for_log(log, "'b'")
         self.assertIn("'b'", after)
 
-    def test_alt_q_does_not_open_the_menu_bar(self) -> None:
+    def test_the_hotkey_does_not_open_the_menu_bar(self) -> None:
         log = Path(tempfile.gettempdir()) / "windowswitcher-menu.txt"
         log.unlink(missing_ok=True)
         target = _Process([PYTHON, str(SUPPORT / "menu_target.py"), str(log)])
@@ -100,7 +106,7 @@ class KeyIsolationTests(unittest.TestCase):
         _wait_for_log(log, "ready")
         time.sleep(1.0)
 
-        send_sequence("alt+q", "esc")
+        send_sequence(TEST_HOTKEY, "esc")
         time.sleep(1.5)
         text = log.read_text(encoding="utf-8")
         focuses = [line.split(" ", 1)[1] for line in text.splitlines() if line.startswith("focus ")]
@@ -111,7 +117,7 @@ class KeyIsolationTests(unittest.TestCase):
 class HotkeyDeliveryTests(unittest.TestCase):
     def test_hotkey_installs_hook_and_shows_markers(self) -> None:
         probe = subprocess.run(
-            [PYTHON, str(SUPPORT / "hotkey_probe.py")],
+            [PYTHON, str(SUPPORT / "hotkey_probe.py"), TEST_HOTKEY],
             cwd=str(ROOT),
             capture_output=True,
             text=True,

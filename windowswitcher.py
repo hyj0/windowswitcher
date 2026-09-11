@@ -5,6 +5,7 @@ import ctypes.wintypes as wt
 import logging
 import os
 import sys
+import threading
 from dataclasses import dataclass, field
 from typing import Callable, Sequence
 
@@ -23,14 +24,18 @@ GA_ROOT = 2
 GA_ROOTOWNER = 3
 GWL_EXSTYLE = -20
 MARKER_PROBE_SIZE = 30
+MONITOR_DEFAULTTONEAREST = 2
 SW_RESTORE = 9
 WS_EX_APPWINDOW = 0x00040000
 WS_EX_TOOLWINDOW = 0x00000080
 
 HC_ACTION = 0
 HOTKEY_ID = 1
+HWND_TOPMOST = -1
 INJECTED_TAG = 0x57535731
 KEYEVENTF_KEYUP = 0x0002
+SWP_NOACTIVATE = 0x0010
+SWP_NOSIZE = 0x0001
 VK_CONTROL = 0x11
 MOD_ALT = 0x0001
 MOD_CONTROL = 0x0002
@@ -43,6 +48,7 @@ VK_F1 = 0x70
 WH_KEYBOARD_LL = 13
 WM_HOTKEY = 0x0312
 WM_KEYDOWN = 0x0100
+WM_QUIT = 0x0012
 WM_SYSKEYDOWN = 0x0104
 
 # Letting modifiers through keeps the host application from seeing them stuck down.
@@ -111,6 +117,13 @@ user32.UnhookWindowsHookEx.argtypes = [wt.HHOOK]
 user32.UnhookWindowsHookEx.restype = wt.BOOL
 kernel32.GetModuleHandleW.argtypes = [wt.LPCWSTR]
 kernel32.GetModuleHandleW.restype = wt.HMODULE
+kernel32.GetCurrentThreadId.restype = wt.DWORD
+user32.PostThreadMessageW.argtypes = [wt.DWORD, wt.UINT, wt.WPARAM, wt.LPARAM]
+user32.PostThreadMessageW.restype = wt.BOOL
+user32.GetMessageW.argtypes = [ctypes.POINTER(wt.MSG), wt.HWND, wt.UINT, wt.UINT]
+user32.GetMessageW.restype = ctypes.c_int
+user32.TranslateMessage.argtypes = [ctypes.POINTER(wt.MSG)]
+user32.DispatchMessageW.argtypes = [ctypes.POINTER(wt.MSG)]
 
 
 class KBDLLHOOKSTRUCT(ctypes.Structure):
@@ -252,6 +265,62 @@ class RECT(ctypes.Structure):
         ("right", wt.LONG),
         ("bottom", wt.LONG),
     ]
+
+
+class MONITORINFO(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wt.DWORD),
+        ("rcMonitor", RECT),
+        ("rcWork", RECT),
+        ("dwFlags", wt.DWORD),
+    ]
+
+
+user32.MonitorFromWindow.argtypes = [wt.HWND, wt.DWORD]
+user32.MonitorFromWindow.restype = wt.HMONITOR
+user32.GetMonitorInfoW.argtypes = [wt.HMONITOR, ctypes.POINTER(MONITORINFO)]
+user32.GetMonitorInfoW.restype = wt.BOOL
+user32.GetWindowRect.argtypes = [wt.HWND, ctypes.POINTER(RECT)]
+user32.GetWindowRect.restype = wt.BOOL
+user32.SetWindowPos.argtypes = [
+    wt.HWND,
+    wt.HWND,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_int,
+    wt.UINT,
+]
+user32.SetWindowPos.restype = wt.BOOL
+
+
+def clamp_to_work_area(rect: RECT, work: RECT | None) -> RECT:
+    """Trim a window rect down to the part of the monitor the user can see.
+
+    Maximized windows report a rect that includes the invisible resize border,
+    so the top edge can sit above the screen. Markers placed there would land
+    outside the virtual desktop and be treated as covered.
+    """
+    if work is None:
+        return rect
+    left = max(rect.left, work.left)
+    top = max(rect.top, work.top)
+    right = min(rect.right, work.right)
+    bottom = min(rect.bottom, work.bottom)
+    if right - left < MARKER_PROBE_SIZE or bottom - top < MARKER_PROBE_SIZE:
+        return rect
+    return RECT(left, top, right, bottom)
+
+
+def _window_work_area(hwnd: int) -> RECT | None:
+    monitor = user32.MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
+    if not monitor:
+        return None
+    info = MONITORINFO()
+    info.cbSize = ctypes.sizeof(MONITORINFO)
+    if not user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+        return None
+    return info.rcWork
 
 
 def _window_text(hwnd: int) -> str:
@@ -411,7 +480,8 @@ def enumerate_window_targets() -> list[Target]:
         if _is_selectable_window(hwnd, own_pid):
             rect = _window_rect(hwnd)
             if rect is not None:
-                positions = visible_marker_positions(hwnd, rect)
+                placement = clamp_to_work_area(rect, _window_work_area(hwnd))
+                positions = visible_marker_positions(hwnd, placement)
                 if positions:
                     targets.append(
                         Target(
@@ -520,10 +590,42 @@ class Marker(QLabel):
             "QLabel { color: #111; background: #ffd43b; "
             "border: 2px solid #111; border-radius: 5px; padding: 2px 5px; }"
         )
+        self._position = position
+        self._resize_to_text()
+
+    def _resize_to_text(self) -> None:
         self.adjustSize()
         size = max(self.width(), self.height(), 30)
         self.resize(size, max(self.height(), 30))
-        self.move(position.x - self.width() // 2, position.y)
+
+    def place(self) -> None:
+        """Position the marker in physical pixels.
+
+        Qt lays widgets out in device independent pixels, so on a monitor with
+        a scale factor other than 100% a Win32 coordinate would land somewhere
+        else entirely, possibly on another screen. Moving the native window
+        keeps the marker exactly on the spot that was probed.
+        """
+        hwnd = int(self.winId())
+        rect = RECT()
+        # Two passes: the first move can cross a DPI boundary and resize us.
+        for _ in range(2):
+            if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                return
+            width = rect.right - rect.left
+            user32.SetWindowPos(
+                hwnd,
+                HWND_TOPMOST,
+                self._position.x - width // 2,
+                self._position.y,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOACTIVATE,
+            )
+
+    def show_marker(self) -> None:
+        self.show()
+        self.place()
 
     def update_prefix(self, prefix: str) -> bool:
         if not self._full_text.startswith(prefix):
@@ -531,8 +633,9 @@ class Marker(QLabel):
             return False
         remaining = self._full_text[len(prefix) :]
         self.setText(remaining or self._full_text)
-        self.adjustSize()
+        self._resize_to_text()
         self.show()
+        self.place()
         return True
 
 
@@ -553,6 +656,78 @@ class HotkeyFilter(QAbstractNativeEventFilter):
         return False, 0
 
 
+class KeyboardHook:
+    """A low level keyboard hook running on its own message pumping thread.
+
+    Windows stops calling a hook that does not answer within
+    ``LowLevelHooksTimeout`` (300 ms by default) and lets the keystroke reach
+    the focused application instead. Enumerating windows and taskbar buttons
+    easily takes longer than that, so the hook cannot share the UI thread.
+    """
+
+    def __init__(self, on_key: Callable[[int, int], None]) -> None:
+        self._on_key = on_key
+        self._thread: threading.Thread | None = None
+        self._thread_id = 0
+        self._handle = 0
+        self._proc: LowLevelKeyboardProc | None = None
+        self._ready = threading.Event()
+
+    @property
+    def installed(self) -> bool:
+        return self._thread is not None
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._ready.clear()
+        thread = threading.Thread(target=self._run, name="keyboard-hook", daemon=True)
+        thread.start()
+        self._ready.wait(2.0)
+        self._thread = thread if self._handle else None
+
+    def stop(self) -> None:
+        thread, thread_id = self._thread, self._thread_id
+        self._thread = None
+        self._thread_id = 0
+        if thread is None:
+            return
+        if thread_id:
+            user32.PostThreadMessageW(thread_id, WM_QUIT, 0, 0)
+        thread.join(2.0)
+
+    def _run(self) -> None:
+        self._thread_id = kernel32.GetCurrentThreadId()
+        self._proc = LowLevelKeyboardProc(self._callback)
+        self._handle = user32.SetWindowsHookExW(
+            WH_KEYBOARD_LL, self._proc, kernel32.GetModuleHandleW(None), 0
+        )
+        self._ready.set()
+        if not self._handle:
+            LOG.error(
+                "无法安装键盘钩子（错误码 %d），标记模式下的按键会传给其他程序",
+                ctypes.GetLastError(),
+            )
+            self._proc = None
+            return
+        message = wt.MSG()
+        while user32.GetMessageW(ctypes.byref(message), None, 0, 0) > 0:
+            user32.TranslateMessage(ctypes.byref(message))
+            user32.DispatchMessageW(ctypes.byref(message))
+        user32.UnhookWindowsHookEx(self._handle)
+        self._handle = 0
+        self._proc = None
+
+    def _callback(self, code: int, wparam: int, lparam: int) -> int:
+        if code == HC_ACTION:
+            info = ctypes.cast(lparam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
+            if info.vkCode not in MODIFIER_KEYS and info.dwExtraInfo != INJECTED_TAG:
+                self._on_key(info.vkCode, wparam)
+                # Swallow the whole key so the focused application never sees it.
+                return 1
+        return user32.CallNextHookEx(None, code, wparam, lparam)
+
+
 class Switcher(QObject):
     activation_requested = Signal()
     key_received = Signal(str)
@@ -564,8 +739,7 @@ class Switcher(QObject):
         self.targets: list[Target] = []
         self.markers: dict[str, list[Marker]] = {}
         self.prefix = ""
-        self._hook: int | None = None
-        self._hook_proc: LowLevelKeyboardProc | None = None
+        self.hook = KeyboardHook(self._on_hook_key)
         self._active = False
         self.activation_requested.connect(self.activate_mode)
         # Queued so the low level hook returns before any window work starts.
@@ -589,8 +763,12 @@ class Switcher(QObject):
         if self._active:
             self.cancel()
             return
+        # Hook first: enumerating windows and taskbar buttons takes a moment,
+        # and anything typed in the meantime would reach the focused app.
+        self.hook.start()
         self.targets = collect_targets()
         if not self.targets:
+            self.hook.stop()
             return
         self.prefix = ""
         self._active = True
@@ -600,46 +778,18 @@ class Switcher(QObject):
             ]
             self.markers[target.label] = target_markers
             for marker in target_markers:
-                marker.show()
+                marker.show_marker()
                 marker.raise_()
-        self._install_hook()
 
-    def _install_hook(self) -> None:
-        if self._hook is not None:
+    def _on_hook_key(self, vk: int, wparam: int) -> None:
+        if wparam not in (WM_KEYDOWN, WM_SYSKEYDOWN):
             return
-        self._hook_proc = LowLevelKeyboardProc(self._low_level_key)
-        self._hook = user32.SetWindowsHookExW(
-            WH_KEYBOARD_LL, self._hook_proc, kernel32.GetModuleHandleW(None), 0
-        )
-        if not self._hook:
-            LOG.error(
-                "无法安装键盘钩子（错误码 %d），标记模式下的按键会传给其他程序",
-                ctypes.GetLastError(),
-            )
-            self._hook = None
-            self._hook_proc = None
-
-    def _remove_hook(self) -> None:
-        if self._hook is not None:
-            user32.UnhookWindowsHookEx(self._hook)
-            self._hook = None
-            self._hook_proc = None
-
-    def _low_level_key(self, code: int, wparam: int, lparam: int) -> int:
-        if code == HC_ACTION:
-            info = ctypes.cast(lparam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
-            vk = info.vkCode
-            if vk not in MODIFIER_KEYS and info.dwExtraInfo != INJECTED_TAG:
-                if wparam in (WM_KEYDOWN, WM_SYSKEYDOWN):
-                    if vk == self.key and _pressed_modifiers() == self.modifiers:
-                        self.key_received.emit("escape")
-                    else:
-                        name = key_name(vk)
-                        if name is not None:
-                            self.key_received.emit(name)
-                # Swallow the whole key so the focused application never sees it.
-                return 1
-        return user32.CallNextHookEx(None, code, wparam, lparam)
+        if vk == self.key and _pressed_modifiers() == self.modifiers:
+            self.key_received.emit("escape")
+            return
+        name = key_name(vk)
+        if name is not None:
+            self.key_received.emit(name)
 
     @Slot(str)
     def process_key(self, key: str) -> None:
@@ -684,7 +834,7 @@ class Switcher(QObject):
         self._finish()
 
     def _finish(self) -> None:
-        self._remove_hook()
+        self.hook.stop()
         for marker_list in self.markers.values():
             for marker in marker_list:
                 marker.close()
@@ -712,20 +862,23 @@ def enable_dpi_awareness() -> None:
             LOG.debug("无法设置 DPI awareness", exc_info=True)
 
 
+DEFAULT_HOTKEY = "alt+q"
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     if sys.platform != "win32":
         raise SystemExit("此程序仅支持 Windows")
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
     )
+    args = list(argv if argv is not None else sys.argv)
+    hotkey = args[1] if len(args) > 1 else DEFAULT_HOTKEY
     enable_dpi_awareness()
-    app = QApplication(list(argv if argv is not None else sys.argv))
+    app = QApplication(args[:1])
     app.setQuitOnLastWindowClosed(False)
-    #switcher = Switcher("ctrl+alt+space")
-    switcher = Switcher("alt+q")
+    switcher = Switcher(hotkey)
     app.aboutToQuit.connect(switcher.shutdown)
-    # LOG.info("窗口切换器已启动：按 Ctrl+Alt+Space 显示字母标记")
-    LOG.info("窗口切换器已启动：按 Alt+q 显示字母标记")
+    LOG.info("窗口切换器已启动：按 %s 显示字母标记", hotkey)
     return app.exec()
 
 
